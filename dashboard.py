@@ -1,3 +1,5 @@
+import logging
+import threading
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -17,6 +19,8 @@ from fetcher import (
 )
 from archive import save_daily_snapshot, list_archive_dates, load_snapshot
 from config import INDICES
+
+log = logging.getLogger(__name__)
 
 _TZ_ET = ZoneInfo("America/New_York")
 _TZ_KST = ZoneInfo("Asia/Seoul")
@@ -120,9 +124,40 @@ def cached_fear_greed():
     return fetch_fear_greed()
 
 
-@st.cache_data(ttl=86400)
-def cached_sector_news(slot):
-    return fetch_sector_news()
+@st.cache_resource
+def _init_news_scheduler():
+    """백그라운드 뉴스 스케줄러. 앱 시작 시 즉시 + 슬롯 변경 시 자동 사전 로딩."""
+    import time
+    state = {
+        "slot": None,
+        "data": None,
+        "lock": threading.Lock(),
+        "ready": threading.Event(),
+    }
+
+    def _loop():
+        while True:
+            try:
+                slot = _news_update_slot()
+                with state["lock"]:
+                    current_slot = state["slot"]
+                if slot != current_slot:
+                    log.info("News scheduler: fetching for slot %s", slot)
+                    result = fetch_sector_news()
+                    with state["lock"]:
+                        state["slot"] = slot
+                        state["data"] = result
+                    state["ready"].set()
+                    log.info("News scheduler: slot %s ready", slot)
+            except Exception as e:
+                log.warning("News scheduler error: %s", e)
+            time.sleep(300)  # 5분마다 슬롯 변경 체크
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return state
+
+
+_news_bg = _init_news_scheduler()
 
 
 @st.cache_data(ttl=3600)
@@ -142,7 +177,11 @@ if is_live:
     sectors = cached_sectors()
     gainers, losers = cached_movers(top_n)
     fg = cached_fear_greed()
-    sector_news = cached_sector_news(_news_update_slot())
+    if not _news_bg["ready"].is_set():
+        with st.spinner("섹터 뉴스를 수집하는 중... (첫 로딩 시 약 2분 소요)"):
+            _news_bg["ready"].wait()
+    with _news_bg["lock"]:
+        sector_news = _news_bg["data"] or {}
     new_highs = cached_new_highs()
     earnings_df = cached_weekly_earnings()
 
