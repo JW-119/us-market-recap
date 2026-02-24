@@ -417,7 +417,7 @@ def _clean_llm_output(text):
 def _summarize_with_llm(sector_name, title, body):
     """Groq (Llama 3.3 70B)으로 '왜?' 요약 생성. SKIP 응답이면 None 반환."""
     from groq import Groq
-    truncated_body = body[:1500]
+    truncated_body = body[:2300]
     est_tokens = len(truncated_body) // 4 + 200 + 150  # 본문 추정 + 시스템 + 출력
     messages = [
         {
