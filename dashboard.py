@@ -245,7 +245,24 @@ if not sectors.empty:
         })
 
     if reason_rows:
-        st.dataframe(pd.DataFrame(reason_rows), hide_index=True, use_container_width=True)
+        reason_df = pd.DataFrame(reason_rows)
+        reason_df["등락 이유"] = reason_df["등락 이유"].apply(
+            lambda x: x.replace(" / ", "<br>") if x != "-" else x
+        )
+        html = reason_df.to_html(index=False, escape=False)
+        st.markdown(
+            "<style>"
+            "#reason-table table { width: 100%; border-collapse: collapse; }"
+            "#reason-table th, #reason-table td { "
+            "  border: 1px solid #444; padding: 6px 10px; text-align: left; "
+            "  word-break: keep-all; white-space: normal; }"
+            "#reason-table th { background: #262730; }"
+            "#reason-table td:nth-child(1) { width: 80px; white-space: nowrap; }"
+            "#reason-table td:nth-child(2) { width: 70px; white-space: nowrap; text-align: right; }"
+            "</style>"
+            f'<div id="reason-table">{html}</div>',
+            unsafe_allow_html=True,
+        )
 
     # 섹터별 뉴스 상세
     for _, row in sectors.iterrows():
