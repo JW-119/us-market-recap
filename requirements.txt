@@ -9,3 +9,4 @@ deep-translator
 PyGithub
 trafilatura
 groq
+feedparser

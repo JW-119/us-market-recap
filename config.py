@@ -82,3 +82,18 @@ NEW_HIGHS_FIELDS = (
 )
 NEW_HIGHS_MIN_MARKET_CAP = 2_000_000_000
 NEW_HIGHS_PAGE_SIZE = 500
+
+# ── 섹터별 Google News 검색 쿼리 ──
+SECTOR_NEWS_QUERIES = {
+    "XLK": "technology sector stocks",
+    "XLF": "financial sector stocks banks",
+    "XLE": "energy sector oil gas stocks",
+    "XLV": "healthcare sector pharma biotech stocks",
+    "XLI": "industrial sector stocks manufacturing",
+    "XLY": "consumer discretionary sector stocks retail",
+    "XLP": "consumer staples sector stocks",
+    "XLB": "materials sector stocks mining chemicals",
+    "XLU": "utilities sector stocks",
+    "XLRE": "real estate sector REIT stocks",
+    "XLC": "communication services sector stocks media",
+}

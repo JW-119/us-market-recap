@@ -1,6 +1,11 @@
+import logging
+import threading
 import time
-from urllib.parse import unquote
+from collections import deque
+from difflib import SequenceMatcher
+from urllib.parse import quote, unquote
 
+import feedparser
 import yfinance as yf
 import pandas as pd
 import requests
@@ -10,8 +15,10 @@ from config import (
     INDICES, SECTOR_ETFS, MAJOR_STOCKS,
     BARCHART_PAGE_URL, BARCHART_API_URL, BARCHART_HEADERS,
     NEW_HIGHS_TARGETS, NEW_HIGHS_FIELDS, NEW_HIGHS_MIN_MARKET_CAP,
-    NEW_HIGHS_PAGE_SIZE, GROQ_API_KEY,
+    NEW_HIGHS_PAGE_SIZE, GROQ_API_KEY, SECTOR_NEWS_QUERIES,
 )
+
+log = logging.getLogger(__name__)
 
 
 def get_market_date():
@@ -177,6 +184,180 @@ def _translate_text(text):
 _NEWS_BLOCKED_PUBLISHERS = {"MT Newswires", "Barchart", "Barrons.com", "Barron's"}
 
 
+# ── Groq Rate Limiter (RPM + TPM 이중 슬라이딩 윈도우) ──
+
+class _GroqRateLimiter:
+    """RPM(28/60s) + TPM(5500/60s) 이중 슬라이딩 윈도우 rate limiter."""
+
+    def __init__(self, max_rpm=28, max_tpm=5500, window_sec=60):
+        self._max_rpm = max_rpm
+        self._max_tpm = max_tpm
+        self._window = window_sec
+        self._call_log: deque = deque()       # (timestamp,)
+        self._token_log: deque = deque()      # (timestamp, tokens)
+        self._lock = threading.Lock()
+
+    def _purge(self, now):
+        while self._call_log and now - self._call_log[0] > self._window:
+            self._call_log.popleft()
+        while self._token_log and now - self._token_log[0][0] > self._window:
+            self._token_log.popleft()
+
+    def _current_tpm(self):
+        return sum(t for _, t in self._token_log)
+
+    def acquire(self, est_tokens=500):
+        """est_tokens: 이 호출의 예상 토큰 수 (입력+출력)."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._purge(now)
+
+                rpm_ok = len(self._call_log) < self._max_rpm
+                tpm_ok = self._current_tpm() + est_tokens <= self._max_tpm
+
+                if rpm_ok and tpm_ok:
+                    self._call_log.append(now)
+                    self._token_log.append((now, est_tokens))
+                    return
+
+                # 대기 시간 계산
+                waits = []
+                if not rpm_ok and self._call_log:
+                    waits.append(self._window - (now - self._call_log[0]) + 0.1)
+                if not tpm_ok and self._token_log:
+                    waits.append(self._window - (now - self._token_log[0][0]) + 0.1)
+                sleep_time = max(waits) if waits else 1.0
+
+            reason = "RPM" if not rpm_ok else "TPM"
+            log.info("Groq %s limit reached, sleeping %.1fs", reason, sleep_time)
+            time.sleep(sleep_time)
+
+
+_groq_limiter = _GroqRateLimiter()
+
+
+# ── Google News RSS 수집 ──
+
+def _fetch_google_news_rss(ticker, query):
+    """Google News RSS에서 검색 쿼리로 기사 수집. 최대 10개 반환."""
+    encoded = quote(query)
+    url = f"https://news.google.com/rss/search?q={encoded}+when:1d&hl=en-US&gl=US&ceid=US:en"
+    try:
+        feed = feedparser.parse(url)
+        results = []
+        for entry in feed.entries[:10]:
+            title = entry.get("title", "")
+            link = entry.get("link", "")
+            source = entry.get("source", {})
+            publisher = source.get("title", "") if isinstance(source, dict) else ""
+            if not title or not link:
+                continue
+            if publisher in _NEWS_BLOCKED_PUBLISHERS:
+                continue
+            results.append({
+                "title": title,
+                "summary": "",
+                "publisher": publisher,
+                "url": link,
+            })
+        return results
+    except Exception:
+        return []
+
+
+# ── 중복 제거 (제목 유사도) ──
+
+def _deduplicate_articles(articles, threshold=0.6):
+    """SequenceMatcher로 제목 유사도 > threshold인 중복 제거."""
+    unique = []
+    for article in articles:
+        is_dup = False
+        for kept in unique:
+            ratio = SequenceMatcher(
+                None, article["title"].lower(), kept["title"].lower()
+            ).ratio()
+            if ratio > threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append(article)
+    return unique
+
+
+# ── 품질 점수 ──
+
+_CAUSAL_KEYWORDS = [
+    "because", "due to", "driven by", "amid", "after", "following",
+    "as", "on", "surge", "plunge", "rally", "drop", "fall", "rise",
+    "gain", "decline", "soar", "tumble", "jump", "slide",
+]
+
+
+def _score_article_quality(title, body):
+    """기사 품질 점수: 본문 길이 + 인과관계 키워드 + 제목 구체성."""
+    score = 0
+    # 본문 길이 (최대 5점)
+    score += min(len(body) / 500, 5)
+    # 인과관계 키워드 (본문에서, 최대 3점)
+    lower_body = body.lower()
+    keyword_hits = sum(1 for kw in _CAUSAL_KEYWORDS if kw in lower_body)
+    score += min(keyword_hits, 3)
+    # 제목 구체성: 숫자 포함 시 +1
+    import re
+    if re.search(r'\d', title):
+        score += 1
+    return score
+
+
+# ── 2단계 합성 LLM ──
+
+def _synthesize_sector_summary(sector_name, summaries):
+    """개별 기사 요약들을 합성하여 1~2문장 섹터 등락 원인 생성."""
+    if not summaries:
+        return ""
+    from groq import Groq
+    bullet_list = "\n".join(f"- {s}" for s in summaries)
+    est_tokens = len(bullet_list) // 4 + 200 + 200  # 입력 추정 + 시스템 + 출력
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "미국 주식 섹터 뉴스 편집자.\n"
+                "아래 개별 기사 요약들을 종합하여, 해당 섹터의 등락 핵심 원인을 "
+                "1~2문장으로 합성하라.\n"
+                "반드시 한국어만 사용. 영어 고유명사(기업명, ETF명)만 영어 허용.\n"
+                "문장 끝은 반드시 명사형 간결체: ~함, ~됨, ~전망, ~때문, ~영향, ~기여 등.\n"
+                "중복 내용은 통합하고, 가장 중요한 원인 위주로 압축할 것."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"섹터: {sector_name}\n\n개별 요약:\n{bullet_list}",
+        },
+    ]
+    for attempt in range(3):
+        try:
+            _groq_limiter.acquire(est_tokens)
+            client = Groq(api_key=GROQ_API_KEY)
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=200,
+            )
+            result = response.choices[0].message.content.strip()
+            return _clean_llm_output(result)
+        except Exception as e:
+            if "429" in str(e) or "rate" in str(e).lower():
+                wait = 2 ** attempt * 5
+                log.warning("Synthesis 429 for %s, retry %d after %ds", sector_name, attempt + 1, wait)
+                time.sleep(wait)
+            else:
+                break
+    return " / ".join(summaries)
+
+
 def _extract_article_body(url):
     """trafilatura로 기사 본문 추출. 실패 시 빈 문자열 반환."""
     try:
@@ -235,59 +416,74 @@ def _clean_llm_output(text):
 
 def _summarize_with_llm(sector_name, title, body):
     """Groq (Llama 3.3 70B)으로 '왜?' 요약 생성. SKIP 응답이면 None 반환."""
-    try:
-        from groq import Groq
-        client = Groq(api_key=GROQ_API_KEY)
-        truncated_body = body[:3000]
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "미국 주식 시장 섹터 뉴스 분석가.\n"
-                        "기사를 읽고 해당 섹터의 등락 원인을 1문장 한국어로 요약.\n"
-                        "반드시 한국어만 사용. 영어 고유명사(기업명, ETF명)만 영어 허용.\n"
-                        "문장 끝은 반드시 명사형 간결체: ~함, ~됨, ~전망, ~때문, ~영향, ~기여 등.\n\n"
-                        "예시:\n"
-                        "- 대법원의 관세 무효화 판결로 수입 비용 부담 완화, 소비재 섹터 반등에 기여함\n"
-                        "- AI 투자 과열 우려 확산으로 기술주 전반 매도세 발생, 섹터 하락 요인으로 작용함\n"
-                        "- 금리 인하 기대감에 부동산 관련주 상승, XLRE 0.5% 상승함\n\n"
-                        "인과관계 없는 기사(종목 소개, 광고, 영상)면 SKIP 이라고만 답할 것."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"섹터: {sector_name}\n"
-                        f"제목: {title}\n"
-                        f"본문:\n{truncated_body}"
-                    ),
-                },
-            ],
-            temperature=0.2,
-            max_tokens=150,
-        )
-        result = response.choices[0].message.content.strip()
-        if result.upper() == "SKIP":
-            return None
-        return _clean_llm_output(result)
-    except Exception:
-        return None
+    from groq import Groq
+    truncated_body = body[:1500]
+    est_tokens = len(truncated_body) // 4 + 200 + 150  # 본문 추정 + 시스템 + 출력
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "미국 주식 시장 섹터 뉴스 분석가.\n"
+                "기사를 읽고 해당 섹터의 등락 원인을 1문장 한국어로 요약.\n"
+                "반드시 한국어만 사용. 영어 고유명사(기업명, ETF명)만 영어 허용.\n"
+                "문장 끝은 반드시 명사형 간결체: ~함, ~됨, ~전망, ~때문, ~영향, ~기여 등.\n\n"
+                "예시:\n"
+                "- 대법원의 관세 무효화 판결로 수입 비용 부담 완화, 소비재 섹터 반등에 기여함\n"
+                "- AI 투자 과열 우려 확산으로 기술주 전반 매도세 발생, 섹터 하락 요인으로 작용함\n"
+                "- 금리 인하 기대감에 부동산 관련주 상승, XLRE 0.5% 상승함\n\n"
+                "인과관계 없는 기사(종목 소개, 광고, 영상)면 SKIP 이라고만 답할 것."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"섹터: {sector_name}\n"
+                f"제목: {title}\n"
+                f"본문:\n{truncated_body}"
+            ),
+        },
+    ]
+    for attempt in range(3):
+        try:
+            _groq_limiter.acquire(est_tokens)
+            client = Groq(api_key=GROQ_API_KEY)
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=150,
+            )
+            result = response.choices[0].message.content.strip()
+            if result.upper() == "SKIP":
+                return None
+            return _clean_llm_output(result)
+        except Exception as e:
+            if "429" in str(e) or "rate" in str(e).lower():
+                wait = 2 ** attempt * 5
+                log.warning("Summarize 429 for %s, retry %d after %ds", sector_name, attempt + 1, wait)
+                time.sleep(wait)
+            else:
+                break
+    return None
 
 
 def fetch_sector_news():
-    """섹터 ETF별 최근 뉴스 3개씩 수집 → {섹터명: [{title, summary, publisher, url}, ...]}."""
+    """섹터 ETF별 뉴스 수집 → {섹터명: {synthesis, articles}}.
+
+    LLM 모드: yfinance + Google News RSS → 중복 제거 → 본문 추출 → 품질 필터/점수
+    → 상위 5개 선택 → 1단계 개별 요약 → 2단계 합성 요약
+    Non-LLM 모드: yfinance만 사용, 번역 후 반환 (synthesis 빈 문자열)
+    """
     sector_map = {tkr: name for tkr, name in SECTOR_ETFS.items()}
     use_llm = bool(GROQ_API_KEY)
 
-    max_candidates = 8 if use_llm else 10
+    max_yf = 8 if use_llm else 10
 
-    def _get_news(tkr):
+    def _get_yf_news(tkr):
         try:
             items = yf.Ticker(tkr).news or []
             results = []
-            for item in items[:max_candidates]:
+            for item in items[:max_yf]:
                 content = item.get("content", {})
                 title = content.get("title", "")
                 summary = content.get("summary", "")
@@ -309,24 +505,47 @@ def fetch_sector_news():
         except Exception:
             return tkr, []
 
-    # 1) 뉴스 수집
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(_get_news, tkr): tkr for tkr in sector_map}
-        raw_output = {}
-        for future in futures:
+    def _get_google_news(tkr):
+        query = SECTOR_NEWS_QUERIES.get(tkr, "")
+        if not query:
+            return tkr, []
+        return tkr, _fetch_google_news_rss(tkr, query)
+
+    # 1) 뉴스 수집: yfinance + Google News RSS (병렬)
+    with ThreadPoolExecutor(max_workers=11) as pool:
+        yf_futures = {pool.submit(_get_yf_news, tkr): tkr for tkr in sector_map}
+        gn_futures = {pool.submit(_get_google_news, tkr): tkr for tkr in sector_map}
+
+        yf_results = {}
+        for future in yf_futures:
             tkr, news_list = future.result()
-            raw_output[sector_map[tkr]] = news_list
+            yf_results[tkr] = news_list
+
+        gn_results = {}
+        for future in gn_futures:
+            tkr, news_list = future.result()
+            gn_results[tkr] = news_list
+
+    # 소스 병합 + 중복 제거
+    raw_output = {}
+    for tkr, sector_name in sector_map.items():
+        combined = yf_results.get(tkr, []) + gn_results.get(tkr, [])
+        deduped = _deduplicate_articles(combined)
+        raw_output[sector_name] = deduped
+        log.info("%s: yf=%d, gn=%d, dedup=%d",
+                 sector_name, len(yf_results.get(tkr, [])),
+                 len(gn_results.get(tkr, [])), len(deduped))
 
     if not use_llm:
-        # ── 기존 동작: yfinance summary + deep_translator 번역 ──
+        # ── Non-LLM: yfinance summary + deep_translator 번역, 새 구조 반환 ──
         output = {}
         for sector, news_list in raw_output.items():
-            output[sector] = news_list[:3]
+            output[sector] = {"synthesis": "", "articles": news_list[:3]}
 
         all_texts = []
         text_map = []
-        for sector, news_list in output.items():
-            for i, n in enumerate(news_list):
+        for sector, data in output.items():
+            for i, n in enumerate(data["articles"]):
                 if n["title"]:
                     all_texts.append(n["title"])
                     text_map.append((sector, i, "title"))
@@ -338,57 +557,85 @@ def fetch_sector_news():
             with ThreadPoolExecutor(max_workers=10) as pool:
                 translated = list(pool.map(_translate_text, all_texts))
             for (sector, i, field), translated_text in zip(text_map, translated):
-                output[sector][i][field] = translated_text
+                output[sector]["articles"][i][field] = translated_text
 
         return output
 
-    # ── LLM 모드: trafilatura 본문 추출 → 품질 필터 → Groq 요약 ──
+    # ── LLM 모드: 본문 추출 → 품질 필터/점수 → 상위 5개 → 2단계 합성 ──
 
     # 2) 모든 기사 URL에서 본문 추출 (병렬)
-    all_articles = []  # (sector, idx, article_dict)
+    all_articles = []  # (sector, article_dict)
     for sector, news_list in raw_output.items():
-        for i, article in enumerate(news_list):
-            all_articles.append((sector, i, article))
+        for article in news_list:
+            all_articles.append((sector, article))
 
-    urls = [a[2]["url"] for a in all_articles]
+    urls = [a[1]["url"] for a in all_articles]
     with ThreadPoolExecutor(max_workers=10) as pool:
         bodies = list(pool.map(_extract_article_body, urls))
 
-    # 3) 본문 200자 미만 제거
-    qualified = []  # (sector, article_dict, body)
-    for (sector, _, article), body in zip(all_articles, bodies):
-        if _is_quality_article(body):
-            qualified.append((sector, article, body))
+    # 3) 품질 필터 (200자+) + 품질 점수 정렬 → 섹터당 상위 5개
+    sector_candidates = {name: [] for name in sector_map.values()}
+    for (sector, article), body in zip(all_articles, bodies):
+        if not _is_quality_article(body):
+            continue
+        score = _score_article_quality(article["title"], body)
+        sector_candidates[sector].append((article, body, score))
 
-    # 4) Groq LLM으로 "왜?" 요약 (병렬)
+    # 점수 내림차순 → 상위 5개
+    top_per_sector = {}
+    for sector, candidates in sector_candidates.items():
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        top_per_sector[sector] = candidates[:5]
+        log.info("%s: %d quality articles, top %d selected",
+                 sector, len(candidates), len(top_per_sector[sector]))
+
+    # 4) 1단계: 개별 LLM 요약 (병렬, 3 workers)
+    summarize_tasks = []  # (sector, article, body)
+    for sector, items in top_per_sector.items():
+        for article, body, _ in items:
+            summarize_tasks.append((sector, article, body))
+
     def _do_summarize(item):
         sector, article, body = item
-        sector_name = sector
-        summary = _summarize_with_llm(sector_name, article["title"], body)
+        summary = _summarize_with_llm(sector, article["title"], body)
         return sector, article, summary
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        summarized = list(pool.map(_do_summarize, qualified))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        summarized = list(pool.map(_do_summarize, summarize_tasks))
 
-    # 5) SKIP 제거 → 섹터당 최대 3개 선별
-    output = {name: [] for name in sector_map.values()}
+    # SKIP 제거 → 섹터별 그룹핑
+    sector_articles = {name: [] for name in sector_map.values()}
+    sector_summaries = {name: [] for name in sector_map.values()}
     for sector, article, summary in summarized:
         if summary is None:
             continue
-        if len(output[sector]) >= 3:
-            continue
-        output[sector].append({
+        sector_articles[sector].append({
             "title": article["title"],
             "summary": summary,
             "publisher": article["publisher"],
             "url": article["url"],
         })
+        sector_summaries[sector].append(summary)
 
-    # 6) 제목만 번역 (summary는 LLM이 한국어로 직접 생성)
+    # 5) 2단계: 섹터별 합성 LLM (병렬, 3 workers)
+    def _do_synthesis(item):
+        sector_name, summaries = item
+        if not summaries:
+            return sector_name, ""
+        synthesis = _synthesize_sector_summary(sector_name, summaries)
+        return sector_name, synthesis
+
+    synthesis_tasks = [(s, sums) for s, sums in sector_summaries.items()]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        synthesis_results = list(pool.map(_do_synthesis, synthesis_tasks))
+
+    synthesis_map = dict(synthesis_results)
+
+    # 6) 제목 번역 (summary는 LLM이 한국어로 직접 생성)
     all_titles = []
     title_map = []
-    for sector, news_list in output.items():
-        for i, n in enumerate(news_list):
+    for sector, articles in sector_articles.items():
+        for i, n in enumerate(articles):
             if n["title"]:
                 all_titles.append(n["title"])
                 title_map.append((sector, i))
@@ -397,7 +644,15 @@ def fetch_sector_news():
         with ThreadPoolExecutor(max_workers=10) as pool:
             translated = list(pool.map(_translate_text, all_titles))
         for (sector, i), translated_title in zip(title_map, translated):
-            output[sector][i]["title"] = translated_title
+            sector_articles[sector][i]["title"] = translated_title
+
+    # 7) 최종 반환: {섹터: {synthesis, articles}}
+    output = {}
+    for sector_name in sector_map.values():
+        output[sector_name] = {
+            "synthesis": synthesis_map.get(sector_name, ""),
+            "articles": sector_articles.get(sector_name, []),
+        }
 
     return output
 

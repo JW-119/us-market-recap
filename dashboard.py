@@ -22,6 +22,13 @@ _TZ_ET = ZoneInfo("America/New_York")
 _TZ_KST = ZoneInfo("Asia/Seoul")
 
 
+def _unpack_sector_news(news_data):
+    """섹터 뉴스 데이터를 (synthesis, articles)로 언팩. 구 아카이브 호환."""
+    if isinstance(news_data, list):  # 구 아카이브 형식
+        return "", news_data
+    return news_data.get("synthesis", ""), news_data.get("articles", [])
+
+
 def _news_update_slot():
     """뉴스 업데이트 스케줄 슬롯. 값이 바뀌면 캐시 갱신.
 
@@ -235,9 +242,13 @@ if not sectors.empty:
     for _, row in sectors.iterrows():
         sec_name = row["섹터"]
         pct = row["등락률"]
-        news_list = sector_news.get(sec_name, [])
-        summaries = [n["summary"] for n in news_list if n.get("summary")]
-        reason = " / ".join(summaries) if summaries else "-"
+        news_data = sector_news.get(sec_name, {})
+        synthesis, articles = _unpack_sector_news(news_data)
+        if synthesis:
+            reason = synthesis
+        else:
+            summaries = [n["summary"] for n in articles if n.get("summary")]
+            reason = " / ".join(summaries) if summaries else "-"
         reason_rows.append({
             "섹터": sec_name,
             "등락률": f"{pct:+.2f}%",
@@ -269,10 +280,13 @@ if not sectors.empty:
         sec_name = row["섹터"]
         pct = row["등락률"]
         sign = "+" if pct >= 0 else ""
-        news_list = sector_news.get(sec_name, [])
+        news_data = sector_news.get(sec_name, {})
+        synthesis, articles = _unpack_sector_news(news_data)
         with st.expander(f"{sec_name}  ({sign}{pct:.2f}%)"):
-            if news_list:
-                for n in news_list:
+            if synthesis:
+                st.info(synthesis)
+            if articles:
+                for n in articles:
                     src = f" — _{n['publisher']}_" if n["publisher"] else ""
                     title = n["title"]
                     if n.get("url"):
@@ -280,7 +294,7 @@ if not sectors.empty:
                     st.markdown(f"- **{title}**{src}")
                     if n["summary"]:
                         st.caption(n["summary"])
-            else:
+            elif not synthesis:
                 st.write("관련 뉴스를 찾을 수 없습니다.")
 
 st.divider()
