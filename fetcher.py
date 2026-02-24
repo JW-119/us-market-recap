@@ -10,7 +10,7 @@ from config import (
     INDICES, SECTOR_ETFS, MAJOR_STOCKS,
     BARCHART_PAGE_URL, BARCHART_API_URL, BARCHART_HEADERS,
     NEW_HIGHS_TARGETS, NEW_HIGHS_FIELDS, NEW_HIGHS_MIN_MARKET_CAP,
-    NEW_HIGHS_PAGE_SIZE,
+    NEW_HIGHS_PAGE_SIZE, GROQ_API_KEY,
 )
 
 
@@ -177,15 +177,75 @@ def _translate_text(text):
 _NEWS_BLOCKED_PUBLISHERS = {"MT Newswires", "Barchart", "Barrons.com", "Barron's"}
 
 
+def _extract_article_body(url):
+    """trafilatura로 기사 본문 추출. 실패 시 빈 문자열 반환."""
+    try:
+        import trafilatura
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return ""
+        text = trafilatura.extract(downloaded)
+        return text or ""
+    except Exception:
+        return ""
+
+
+def _is_quality_article(body):
+    """본문 200자 미만이면 영상/비기사로 판단하여 제거."""
+    return len(body) >= 200
+
+
+def _summarize_with_llm(sector_name, title, body):
+    """Groq (Llama 3.3 70B)으로 '왜?' 요약 생성. SKIP 응답이면 None 반환."""
+    try:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        truncated_body = body[:3000]
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "당신은 미국 주식 시장 섹터 뉴스 분석가입니다. "
+                        "기사를 읽고 해당 섹터가 왜 움직였는지 인과관계를 "
+                        "1~2문장 한국어로 요약하세요. "
+                        "인과관계가 없는 기사(단순 종목 소개, 광고, 영상 요약 등)면 "
+                        "반드시 SKIP 이라고만 답하세요."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"섹터: {sector_name}\n"
+                        f"제목: {title}\n"
+                        f"본문:\n{truncated_body}"
+                    ),
+                },
+            ],
+            temperature=0.3,
+            max_tokens=200,
+        )
+        result = response.choices[0].message.content.strip()
+        if result.upper() == "SKIP":
+            return None
+        return result
+    except Exception:
+        return None
+
+
 def fetch_sector_news():
     """섹터 ETF별 최근 뉴스 3개씩 수집 → {섹터명: [{title, summary, publisher, url}, ...]}."""
     sector_map = {tkr: name for tkr, name in SECTOR_ETFS.items()}
+    use_llm = bool(GROQ_API_KEY)
+
+    max_candidates = 8 if use_llm else 10
 
     def _get_news(tkr):
         try:
             items = yf.Ticker(tkr).news or []
             results = []
-            for item in items[:10]:
+            for item in items[:max_candidates]:
                 content = item.get("content", {})
                 title = content.get("title", "")
                 summary = content.get("summary", "")
@@ -203,8 +263,6 @@ def fetch_sector_news():
                     "publisher": publisher,
                     "url": url,
                 })
-                if len(results) >= 3:
-                    break
             return tkr, results
         except Exception:
             return tkr, []
@@ -212,28 +270,92 @@ def fetch_sector_news():
     # 1) 뉴스 수집
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(_get_news, tkr): tkr for tkr in sector_map}
-        output = {}
+        raw_output = {}
         for future in futures:
             tkr, news_list = future.result()
-            output[sector_map[tkr]] = news_list
+            raw_output[sector_map[tkr]] = news_list
 
-    # 2) 번역 (title + summary 병렬 처리)
-    all_texts = []
-    text_map = []  # (sector, idx, field)
+    if not use_llm:
+        # ── 기존 동작: yfinance summary + deep_translator 번역 ──
+        output = {}
+        for sector, news_list in raw_output.items():
+            output[sector] = news_list[:3]
+
+        all_texts = []
+        text_map = []
+        for sector, news_list in output.items():
+            for i, n in enumerate(news_list):
+                if n["title"]:
+                    all_texts.append(n["title"])
+                    text_map.append((sector, i, "title"))
+                if n["summary"]:
+                    all_texts.append(n["summary"])
+                    text_map.append((sector, i, "summary"))
+
+        if all_texts:
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                translated = list(pool.map(_translate_text, all_texts))
+            for (sector, i, field), translated_text in zip(text_map, translated):
+                output[sector][i][field] = translated_text
+
+        return output
+
+    # ── LLM 모드: trafilatura 본문 추출 → 품질 필터 → Groq 요약 ──
+
+    # 2) 모든 기사 URL에서 본문 추출 (병렬)
+    all_articles = []  # (sector, idx, article_dict)
+    for sector, news_list in raw_output.items():
+        for i, article in enumerate(news_list):
+            all_articles.append((sector, i, article))
+
+    urls = [a[2]["url"] for a in all_articles]
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        bodies = list(pool.map(_extract_article_body, urls))
+
+    # 3) 본문 200자 미만 제거
+    qualified = []  # (sector, article_dict, body)
+    for (sector, _, article), body in zip(all_articles, bodies):
+        if _is_quality_article(body):
+            qualified.append((sector, article, body))
+
+    # 4) Groq LLM으로 "왜?" 요약 (병렬)
+    def _do_summarize(item):
+        sector, article, body = item
+        sector_name = sector
+        summary = _summarize_with_llm(sector_name, article["title"], body)
+        return sector, article, summary
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        summarized = list(pool.map(_do_summarize, qualified))
+
+    # 5) SKIP 제거 → 섹터당 최대 3개 선별
+    output = {name: [] for name in sector_map.values()}
+    for sector, article, summary in summarized:
+        if summary is None:
+            continue
+        if len(output[sector]) >= 3:
+            continue
+        output[sector].append({
+            "title": article["title"],
+            "summary": summary,
+            "publisher": article["publisher"],
+            "url": article["url"],
+        })
+
+    # 6) 제목만 번역 (summary는 LLM이 한국어로 직접 생성)
+    all_titles = []
+    title_map = []
     for sector, news_list in output.items():
         for i, n in enumerate(news_list):
             if n["title"]:
-                all_texts.append(n["title"])
-                text_map.append((sector, i, "title"))
-            if n["summary"]:
-                all_texts.append(n["summary"])
-                text_map.append((sector, i, "summary"))
+                all_titles.append(n["title"])
+                title_map.append((sector, i))
 
-    if all_texts:
+    if all_titles:
         with ThreadPoolExecutor(max_workers=10) as pool:
-            translated = list(pool.map(_translate_text, all_texts))
-        for (sector, i, field), translated_text in zip(text_map, translated):
-            output[sector][i][field] = translated_text
+            translated = list(pool.map(_translate_text, all_titles))
+        for (sector, i), translated_title in zip(title_map, translated):
+            output[sector][i]["title"] = translated_title
 
     return output
 

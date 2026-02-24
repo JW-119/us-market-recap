@@ -1,3 +1,6 @@
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -14,6 +17,37 @@ from fetcher import (
 )
 from archive import save_daily_snapshot, list_archive_dates, load_snapshot
 from config import INDICES
+
+_TZ_ET = ZoneInfo("America/New_York")
+_TZ_KST = ZoneInfo("Asia/Seoul")
+
+
+def _news_update_slot():
+    """뉴스 업데이트 스케줄 슬롯. 값이 바뀌면 캐시 갱신.
+
+    업데이트 시점: 장 시작(09:30 ET), 장 마감(16:00 ET), 한국 아침(08:00 KST)
+    """
+    now = datetime.now(timezone.utc)
+    now_et = now.astimezone(_TZ_ET)
+    today_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_et = today_et - timedelta(days=1)
+
+    now_kst = now.astimezone(_TZ_KST)
+    today_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_kst = today_kst - timedelta(days=1)
+
+    slots = [
+        today_et.replace(hour=9, minute=30),       # 장 시초
+        today_et.replace(hour=16, minute=0),        # 장 마감
+        today_kst.replace(hour=8, minute=0),        # 한국 아침
+        yesterday_et.replace(hour=9, minute=30),
+        yesterday_et.replace(hour=16, minute=0),
+        yesterday_kst.replace(hour=8, minute=0),
+    ]
+
+    slots_utc = [s.astimezone(timezone.utc) for s in slots]
+    past = [s for s in slots_utc if s <= now]
+    return str(max(past)) if past else str(min(slots_utc))
 
 st.set_page_config(page_title="US Market Recap", page_icon="📊", layout="wide")
 
@@ -79,8 +113,8 @@ def cached_fear_greed():
     return fetch_fear_greed()
 
 
-@st.cache_data(ttl=300)
-def cached_sector_news():
+@st.cache_data(ttl=86400)
+def cached_sector_news(slot):
     return fetch_sector_news()
 
 
@@ -101,7 +135,7 @@ if is_live:
     sectors = cached_sectors()
     gainers, losers = cached_movers(top_n)
     fg = cached_fear_greed()
-    sector_news = cached_sector_news()
+    sector_news = cached_sector_news(_news_update_slot())
     new_highs = cached_new_highs()
     earnings_df = cached_weekly_earnings()
 
@@ -196,6 +230,24 @@ st.divider()
 # ── 3. 섹터별 주요 이슈 ──
 st.subheader("섹터별 주요 이슈")
 if not sectors.empty:
+    # 등락 이유 요약 표
+    reason_rows = []
+    for _, row in sectors.iterrows():
+        sec_name = row["섹터"]
+        pct = row["등락률"]
+        news_list = sector_news.get(sec_name, [])
+        summaries = [n["summary"] for n in news_list if n.get("summary")]
+        reason = " / ".join(summaries) if summaries else "-"
+        reason_rows.append({
+            "섹터": sec_name,
+            "등락률": f"{pct:+.2f}%",
+            "등락 이유": reason,
+        })
+
+    if reason_rows:
+        st.dataframe(pd.DataFrame(reason_rows), hide_index=True, use_container_width=True)
+
+    # 섹터별 뉴스 상세
     for _, row in sectors.iterrows():
         sec_name = row["섹터"]
         pct = row["등락률"]

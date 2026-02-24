@@ -7,3 +7,5 @@ plotly
 schedule
 deep-translator
 PyGithub
+trafilatura
+groq

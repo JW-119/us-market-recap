@@ -19,6 +19,9 @@ def _get(key, default=""):
 TELEGRAM_BOT_TOKEN = _get("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = _get("CHANNEL_ID")
 
+# ── Groq (섹터 뉴스 LLM 요약) ──
+GROQ_API_KEY = _get("GROQ_API_KEY")
+
 # ── GitHub Archive ──
 GITHUB_TOKEN = _get("GITHUB_TOKEN")
 GITHUB_REPO = _get("GITHUB_REPO", "JW-119/us-market-recap")
