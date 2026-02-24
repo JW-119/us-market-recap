@@ -1,3 +1,4 @@
+import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from fetcher import (
@@ -5,8 +6,13 @@ from fetcher import (
     fetch_sectors,
     fetch_top_movers,
     fetch_index_history,
+    fetch_sector_news,
+    fetch_weekly_earnings,
+    fetch_fear_greed,
+    fetch_new_highs,
     get_market_date,
 )
+from archive import save_daily_snapshot, list_archive_dates, load_snapshot
 from config import INDICES
 
 st.set_page_config(page_title="US Market Recap", page_icon="📊", layout="wide")
@@ -26,6 +32,20 @@ chart_period = st.sidebar.selectbox(
 top_n = st.sidebar.slider("Top Movers 수", min_value=3, max_value=20, value=10)
 if st.sidebar.button("🔄 새로고침"):
     st.cache_data.clear()
+
+# ── 사이드바: 아카이브 ──
+st.sidebar.divider()
+st.sidebar.subheader("📁 아카이브")
+
+archive_dates = list_archive_dates()
+archive_options = ["📡 실시간"] + archive_dates
+selected = st.sidebar.radio(
+    "조회 날짜",
+    archive_options,
+    index=0,
+    label_visibility="collapsed",
+)
+is_live = selected == "📡 실시간"
 
 
 # ── 캐시 래퍼 ──
@@ -54,27 +74,96 @@ def cached_date():
     return get_market_date()
 
 
+@st.cache_data(ttl=300)
+def cached_fear_greed():
+    return fetch_fear_greed()
+
+
+@st.cache_data(ttl=300)
+def cached_sector_news():
+    return fetch_sector_news()
+
+
+@st.cache_data(ttl=3600)
+def cached_weekly_earnings():
+    return fetch_weekly_earnings()
+
+
+@st.cache_data(ttl=300)
+def cached_new_highs():
+    return fetch_new_highs()
+
+
 # ── 데이터 로드 ──
-market_date = cached_date()
-st.title(f"📊 미국 시장 시황 — {market_date or ''}")
+if is_live:
+    market_date = cached_date()
+    indices = cached_indices()
+    sectors = cached_sectors()
+    gainers, losers = cached_movers(top_n)
+    fg = cached_fear_greed()
+    sector_news = cached_sector_news()
+    new_highs = cached_new_highs()
+    earnings_df = cached_weekly_earnings()
 
-indices = cached_indices()
-sectors = cached_sectors()
-gainers, losers = cached_movers(top_n)
+    # 자동 아카이브 저장
+    if market_date and not indices.empty:
+        snapshot = {
+            "market_date": market_date,
+            "indices": indices.to_dict(orient="records"),
+            "fear_greed": fg,
+            "sectors": sectors.to_dict(orient="records") if not sectors.empty else [],
+            "sector_news": sector_news,
+            "new_highs": {
+                k: v.to_dict(orient="records") if isinstance(v, pd.DataFrame) and not v.empty else []
+                for k, v in new_highs.items()
+            },
+            "earnings": earnings_df.to_dict(orient="records") if not earnings_df.empty else [],
+            "gainers": gainers.to_dict(orient="records") if not gainers.empty else [],
+            "losers": losers.to_dict(orient="records") if not losers.empty else [],
+        }
+        save_daily_snapshot(snapshot)
+else:
+    # 아카이브 모드
+    snap = load_snapshot(selected)
+    if snap is None:
+        st.error(f"'{selected}' 아카이브를 불러올 수 없습니다.")
+        st.stop()
+
+    market_date = snap["market_date"]
+    indices = pd.DataFrame(snap.get("indices", []))
+    sectors = pd.DataFrame(snap.get("sectors", []))
+    fg = snap.get("fear_greed")
+    sector_news = snap.get("sector_news", {})
+    new_highs = {k: pd.DataFrame(v) for k, v in snap.get("new_highs", {}).items()}
+    earnings_df = pd.DataFrame(snap.get("earnings", []))
+    gainers = pd.DataFrame(snap.get("gainers", []))
+    losers = pd.DataFrame(snap.get("losers", []))
 
 
-# ── 1. 지수 요약 (st.metric) ──
+# ── 제목 ──
+mode_label = "" if is_live else " (아카이브)"
+st.title(f"📊 미국 시장 시황 — {market_date or ''}{mode_label}")
+
+
+# ── 1. 지수 요약 (st.metric) + Fear & Greed ──
 st.subheader("주요 지수")
 if not indices.empty:
-    cols = st.columns(len(indices))
+    n_cols = len(indices) + (1 if fg else 0)
+    cols = st.columns(n_cols)
     for col, (_, row) in zip(cols, indices.iterrows()):
-        # VIX는 inverse 색상 (상승=빨강, 하락=초록)
         delta_color = "inverse" if row["티커"] == "^VIX" else "normal"
         col.metric(
             label=row["이름"],
             value=f"{row['종가']:,.2f}",
             delta=f"{row['변동']:+,.2f} ({row['등락률']:+.2f}%)",
             delta_color=delta_color,
+        )
+    if fg:
+        cols[-1].metric(
+            label=f"Fear & Greed ({fg['rating']})",
+            value=fg["score"],
+            delta=f"{fg['change']:+d}",
+            delta_color="normal",
         )
 
 st.divider()
@@ -99,60 +188,112 @@ if not sectors.empty:
         height=400,
         margin=dict(l=0, r=40, t=10, b=30),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 st.divider()
 
 
-# ── 3. 지수 추이 (캔들스틱 탭) ──
-st.subheader("지수 추이")
-index_names = list(INDICES.values())
-index_tickers = list(INDICES.keys())
-tabs = st.tabs(index_names)
+# ── 3. 섹터별 주요 이슈 ──
+st.subheader("섹터별 주요 이슈")
+if not sectors.empty:
+    for _, row in sectors.iterrows():
+        sec_name = row["섹터"]
+        pct = row["등락률"]
+        sign = "+" if pct >= 0 else ""
+        news_list = sector_news.get(sec_name, [])
+        with st.expander(f"{sec_name}  ({sign}{pct:.2f}%)"):
+            if news_list:
+                for n in news_list:
+                    src = f" — _{n['publisher']}_" if n["publisher"] else ""
+                    title = n["title"]
+                    if n.get("url"):
+                        title = f"[{title}]({n['url']})"
+                    st.markdown(f"- **{title}**{src}")
+                    if n["summary"]:
+                        st.caption(n["summary"])
+            else:
+                st.write("관련 뉴스를 찾을 수 없습니다.")
 
-for tab, tkr, name in zip(tabs, index_tickers, index_names):
+st.divider()
+
+
+# ── 4. 신고가 종목 ──
+st.subheader("신고가 종목")
+tab_labels = []
+for target in ["52주 신고가", "3개월 신고가"]:
+    df = new_highs.get(target, pd.DataFrame())
+    tab_labels.append(f"{target} ({len(df)})")
+
+nh_tabs = st.tabs(tab_labels)
+for tab, target in zip(nh_tabs, ["52주 신고가", "3개월 신고가"]):
     with tab:
-        hist = cached_history(tkr, chart_period)
-        if hist.empty:
-            st.warning(f"{name} 데이터를 불러올 수 없습니다.")
-            continue
-
-        fig = go.Figure(go.Candlestick(
-            x=hist.index,
-            open=hist["Open"],
-            high=hist["High"],
-            low=hist["Low"],
-            close=hist["Close"],
-        ))
-        fig.update_layout(
-            title=name,
-            xaxis_rangeslider_visible=False,
-            height=420,
-            margin=dict(l=0, r=0, t=40, b=30),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        df = new_highs.get(target, pd.DataFrame())
+        if df.empty:
+            st.info(f"{target} 데이터가 없습니다.")
+        else:
+            st.dataframe(df, hide_index=True, width="stretch")
 
 st.divider()
 
 
-# ── 4. Top Movers ──
+# ── 5. 이번 주 실적 발표 일정 ──
+st.subheader("📅 이번 주 실적 발표 일정")
+if earnings_df.empty:
+    st.info("이번 주 예정된 실적 발표가 없습니다.")
+else:
+    st.dataframe(earnings_df, hide_index=True, width="stretch")
+
+st.divider()
+
+
+# ── 6. 지수 추이 (캔들스틱 탭) — 실시간 모드에서만 ──
+if is_live:
+    st.subheader("지수 추이")
+    index_names = list(INDICES.values())
+    index_tickers = list(INDICES.keys())
+    tabs = st.tabs(index_names)
+
+    for tab, tkr, name in zip(tabs, index_tickers, index_names):
+        with tab:
+            hist = cached_history(tkr, chart_period)
+            if hist.empty:
+                st.warning(f"{name} 데이터를 불러올 수 없습니다.")
+                continue
+
+            fig = go.Figure(go.Candlestick(
+                x=hist.index,
+                open=hist["Open"],
+                high=hist["High"],
+                low=hist["Low"],
+                close=hist["Close"],
+            ))
+            fig.update_layout(
+                title=name,
+                xaxis_rangeslider_visible=False,
+                height=420,
+                margin=dict(l=0, r=0, t=40, b=30),
+            )
+            st.plotly_chart(fig, width="stretch")
+
+    st.divider()
+
+
+# ── 7. Top Movers ──
 st.subheader(f"Top {top_n} Movers")
 col_gain, col_lose = st.columns(2)
 
 with col_gain:
     st.markdown("**🔺 상승**")
     if not gainers.empty:
-        display = gainers[["티커", "종가", "변동", "등락률"]].copy()
+        display = gainers[["종목명", "티커", "종가", "등락률"]].copy()
         display["등락률"] = display["등락률"].apply(lambda x: f"+{x:.2f}%")
-        display["변동"] = display["변동"].apply(lambda x: f"+{x:,.2f}")
         display["종가"] = display["종가"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(display, hide_index=True, use_container_width=True)
+        st.dataframe(display, hide_index=True, width="stretch")
 
 with col_lose:
     st.markdown("**🔻 하락**")
     if not losers.empty:
-        display = losers[["티커", "종가", "변동", "등락률"]].copy()
+        display = losers[["종목명", "티커", "종가", "등락률"]].copy()
         display["등락률"] = display["등락률"].apply(lambda x: f"{x:.2f}%")
-        display["변동"] = display["변동"].apply(lambda x: f"{x:,.2f}")
         display["종가"] = display["종가"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(display, hide_index=True, use_container_width=True)
+        st.dataframe(display, hide_index=True, width="stretch")

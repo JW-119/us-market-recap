@@ -19,6 +19,10 @@ def _get(key, default=""):
 TELEGRAM_BOT_TOKEN = _get("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = _get("CHANNEL_ID")
 
+# ── GitHub Archive ──
+GITHUB_TOKEN = _get("GITHUB_TOKEN")
+GITHUB_REPO = _get("GITHUB_REPO", "JW-119/us-market-recap")
+
 # ── 주요 지수 ──
 INDICES = {
     "^GSPC": "S&P 500",
@@ -52,3 +56,26 @@ MAJOR_STOCKS = [
     "CSCO", "MCD", "ABT", "PM", "TXN", "QCOM", "ISRG", "INTU",
     "AMGN", "GE", "AMAT", "CAT", "GS", "NOW", "MS", "NEE",
 ]
+
+# ── Barchart New Highs ──
+BARCHART_PAGE_URL = "https://www.barchart.com/stocks/highs-lows/highs?timeFrame=52w"
+BARCHART_API_URL = "https://www.barchart.com/proxies/core-api/v1/quotes/get"
+BARCHART_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+NEW_HIGHS_TARGETS = [
+    {"lists": "stocks.us.new_highs_lows.highs.overall.1y", "label": "52주 신고가"},
+    {"lists": "stocks.us.new_highs_lows.highs.overall.3m", "label": "3개월 신고가"},
+]
+NEW_HIGHS_FIELDS = (
+    "symbol,symbolName,marketCap,lastPrice,priceChange,percentChange,"
+    "volume,percentChange1m,percentChange3m,percentChange1y,percentChangeYtd"
+)
+NEW_HIGHS_MIN_MARKET_CAP = 2_000_000_000
+NEW_HIGHS_PAGE_SIZE = 500

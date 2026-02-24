@@ -5,3 +5,5 @@ python-dotenv
 streamlit
 plotly
 schedule
+deep-translator
+PyGithub
