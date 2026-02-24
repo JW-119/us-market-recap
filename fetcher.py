@@ -9,7 +9,7 @@ import feedparser
 import yfinance as yf
 import pandas as pd
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from config import (
     INDICES, SECTOR_ETFS, MAJOR_STOCKS,
@@ -189,7 +189,7 @@ _NEWS_BLOCKED_PUBLISHERS = {"MT Newswires", "Barchart", "Barrons.com", "Barron's
 class _GroqRateLimiter:
     """RPM(28/60s) + TPM(5500/60s) 이중 슬라이딩 윈도우 rate limiter."""
 
-    def __init__(self, max_rpm=28, max_tpm=5500, window_sec=60):
+    def __init__(self, max_rpm=28, max_tpm=20000, window_sec=60):
         self._max_rpm = max_rpm
         self._max_tpm = max_tpm
         self._window = window_sec
@@ -316,7 +316,6 @@ def _synthesize_sector_summary(sector_name, summaries):
     """개별 기사 요약들을 합성하여 1~2문장 섹터 등락 원인 생성."""
     if not summaries:
         return ""
-    from groq import Groq
     bullet_list = "\n".join(f"- {s}" for s in summaries)
     est_tokens = len(bullet_list) // 4 + 200 + 200  # 입력 추정 + 시스템 + 출력
     messages = [
@@ -338,10 +337,11 @@ def _synthesize_sector_summary(sector_name, summaries):
     ]
     for attempt in range(3):
         try:
+            from groq import Groq
             _groq_limiter.acquire(est_tokens)
             client = Groq(api_key=GROQ_API_KEY)
             response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
                 messages=messages,
                 temperature=0.2,
                 max_tokens=200,
@@ -415,8 +415,7 @@ def _clean_llm_output(text):
 
 
 def _summarize_with_llm(sector_name, title, body):
-    """Groq (Llama 3.3 70B)으로 '왜?' 요약 생성. SKIP 응답이면 None 반환."""
-    from groq import Groq
+    """Groq LLM으로 '왜?' 요약 생성. SKIP 응답이면 None 반환."""
     truncated_body = body[:2300]
     est_tokens = len(truncated_body) // 4 + 200 + 150  # 본문 추정 + 시스템 + 출력
     messages = [
@@ -445,10 +444,11 @@ def _summarize_with_llm(sector_name, title, body):
     ]
     for attempt in range(3):
         try:
+            from groq import Groq
             _groq_limiter.acquire(est_tokens)
             client = Groq(api_key=GROQ_API_KEY)
             response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
                 messages=messages,
                 temperature=0.2,
                 max_tokens=150,
@@ -864,3 +864,68 @@ def fetch_new_highs():
             results[label] = df
 
     return results
+
+
+def fetch_overnight():
+    """22:30 KST(전날) ~ 현재 사이의 선물/VIX 변동 + 주요 뉴스."""
+    from zoneinfo import ZoneInfo
+    _TZ_KST = ZoneInfo("Asia/Seoul")
+    now = datetime.now(timezone.utc)
+    now_kst = now.astimezone(_TZ_KST)
+
+    # 기준 시각: 전날 22:30 KST
+    yesterday_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    base_time = yesterday_kst.replace(hour=22, minute=30)
+
+    # 1) 선물 데이터 (ES=F, NQ=F) + VIX (^VIX)
+    tickers = ["ES=F", "NQ=F", "^VIX"]
+    result = {"futures": [], "news": []}
+
+    try:
+        data = yf.download(tickers, period="2d", interval="1h",
+                           progress=False, group_by="ticker")
+    except Exception:
+        return None
+
+    names = {"ES=F": "S&P 500 선물", "NQ=F": "NASDAQ 100 선물", "^VIX": "VIX"}
+    for tkr in tickers:
+        try:
+            df = data[tkr].dropna(subset=["Close"])
+            if len(df) < 2:
+                continue
+            # base_time에 가장 가까운 행 vs 최신 행
+            base_utc = base_time.astimezone(timezone.utc)
+            df_utc = df.index.tz_localize("UTC") if df.index.tz is None else df.index
+            past = df_utc[df_utc <= base_utc]
+            if past.empty:
+                continue
+            base_idx = past[-1]
+            base_close = float(df.loc[df.index[df_utc == base_idx][0], "Close"])
+            latest_close = float(df["Close"].iloc[-1])
+            chg = latest_close - base_close
+            pct = chg / base_close * 100
+            result["futures"].append({
+                "name": names[tkr], "ticker": tkr,
+                "base": round(base_close, 2),
+                "latest": round(latest_close, 2),
+                "change": round(chg, 2),
+                "pct": round(pct, 2),
+            })
+        except Exception:
+            continue
+
+    # 2) 오버나이트 뉴스 (Google News RSS, 번역만)
+    query = "US stock market overnight futures"
+    articles = _fetch_google_news_rss("overnight", query)
+    titles = [a["title"] for a in articles[:5]]
+    if titles:
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            translated = list(pool.map(_translate_text, titles))
+        for article, title_kr in zip(articles[:5], translated):
+            result["news"].append({
+                "title": title_kr,
+                "publisher": article["publisher"],
+                "url": article["url"],
+            })
+
+    return result if result["futures"] else None

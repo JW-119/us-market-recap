@@ -16,6 +16,7 @@ from fetcher import (
     fetch_fear_greed,
     fetch_new_highs,
     get_market_date,
+    fetch_overnight,
 )
 from archive import save_daily_snapshot, list_archive_dates, load_snapshot
 from config import INDICES
@@ -36,24 +37,20 @@ def _unpack_sector_news(news_data):
 def _news_update_slot():
     """뉴스 업데이트 스케줄 슬롯. 값이 바뀌면 캐시 갱신.
 
-    업데이트 시점: 장 시작(09:30 ET), 장 마감(16:00 ET), 한국 아침(08:00 KST)
+    업데이트 시점 (KST 기준): 08:00, 17:00, 22:30
     """
     now = datetime.now(timezone.utc)
-    now_et = now.astimezone(_TZ_ET)
-    today_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday_et = today_et - timedelta(days=1)
-
     now_kst = now.astimezone(_TZ_KST)
     today_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_kst = today_kst - timedelta(days=1)
 
     slots = [
-        today_et.replace(hour=9, minute=30),       # 장 시초
-        today_et.replace(hour=16, minute=0),        # 장 마감
         today_kst.replace(hour=8, minute=0),        # 한국 아침
-        yesterday_et.replace(hour=9, minute=30),
-        yesterday_et.replace(hour=16, minute=0),
+        today_kst.replace(hour=17, minute=0),       # 한국 오후
+        today_kst.replace(hour=22, minute=30),      # 장전
         yesterday_kst.replace(hour=8, minute=0),
+        yesterday_kst.replace(hour=17, minute=0),
+        yesterday_kst.replace(hour=22, minute=30),
     ]
 
     slots_utc = [s.astimezone(timezone.utc) for s in slots]
@@ -170,6 +167,11 @@ def cached_new_highs():
     return fetch_new_highs()
 
 
+@st.cache_data(ttl=300)
+def cached_overnight():
+    return fetch_overnight()
+
+
 # ── 데이터 로드 ──
 if is_live:
     market_date = cached_date()
@@ -223,6 +225,44 @@ else:
 # ── 제목 ──
 mode_label = "" if is_live else " (아카이브)"
 st.title(f"📊 미국 시장 시황 — {market_date or ''}{mode_label}")
+
+# ── 오버나이트 시황 변경점 ──
+_now_kst = datetime.now(timezone.utc).astimezone(_TZ_KST)
+_show_overnight = 6 <= _now_kst.hour < 10
+
+if is_live and _show_overnight:
+    overnight = cached_overnight()
+    if overnight:
+        st.subheader("🌙 오버나이트 시황 변경점")
+        st.caption("전일 22:30 KST 대비 현재 변동")
+        futures = overnight["futures"]
+        if futures:
+            ov_cols = st.columns(len(futures) + (1 if fg and fg.get("change") is not None else 0))
+            for col, f in zip(ov_cols, futures):
+                delta_color = "inverse" if f["ticker"] == "^VIX" else "normal"
+                col.metric(
+                    label=f["name"],
+                    value=f"{f['latest']:,.2f}",
+                    delta=f"{f['change']:+,.2f} ({f['pct']:+.2f}%)",
+                    delta_color=delta_color,
+                )
+            if fg and fg.get("change") is not None:
+                ov_cols[-1].metric(
+                    label=f"Fear & Greed ({fg['rating']})",
+                    value=fg["score"],
+                    delta=f"{fg['change']:+d}",
+                    delta_color="normal",
+                )
+        news = overnight.get("news", [])
+        if news:
+            st.markdown("**주요 오버나이트 뉴스**")
+            for n in news:
+                src = f" — _{n['publisher']}_" if n.get("publisher") else ""
+                title = n["title"]
+                if n.get("url"):
+                    title = f"[{title}]({n['url']})"
+                st.markdown(f"- {title}{src}")
+        st.divider()
 
 
 # ── 1. 지수 요약 (st.metric) + Fear & Greed ──
