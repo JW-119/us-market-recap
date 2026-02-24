@@ -256,7 +256,7 @@ if not sectors.empty:
             "#reason-table th, #reason-table td { "
             "  border: 1px solid #444; padding: 6px 10px; text-align: left; "
             "  word-break: keep-all; white-space: normal; }"
-            "#reason-table th { background: #262730; }"
+            "#reason-table th { background: #262730; color: #FAFAFA; }"
             "#reason-table td:nth-child(1) { width: 80px; white-space: nowrap; }"
             "#reason-table td:nth-child(2) { width: 70px; white-space: nowrap; text-align: right; }"
             "</style>"
