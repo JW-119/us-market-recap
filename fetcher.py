@@ -377,8 +377,14 @@ def _is_quality_article(body):
 
 
 def _clean_llm_output(text):
-    """LLM 출력 후처리: 비한국어 문자 제거 + 말투 교정."""
+    """LLM 출력 후처리: 프롬프트 에코 제거 + 줄바꿈 정리 + 비한국어 문자 제거 + 말투 교정."""
     import re
+    # 프롬프트 에코 제거 (모델이 입력을 되풀이하는 경우)
+    text = re.sub(r'^.*?개별\s*(?:기사\s*)?요약\s*(?:종합)?[:：]\s*', '', text, flags=re.DOTALL)
+    text = re.sub(r'^섹터[:：]\s*\S+\s*', '', text)
+    # 리터럴 \n 및 실제 줄바꿈 → 공백
+    text = text.replace('\\n', ' ').replace('\n', ' ')
+    text = re.sub(r'\s{2,}', ' ', text)
     # 비한국어/비ASCII 스크립트 제거 (한글, ASCII, 숫자, 기본 구두점만 허용)
     text = re.sub(r'[^\uAC00-\uD7A3\u3131-\u3163\u1100-\u11FF'
                   r'a-zA-Z0-9\s\.,;:!\?\-\+\%\(\)\/\'\"~$&@#]', '', text)
