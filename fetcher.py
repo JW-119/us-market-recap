@@ -195,6 +195,44 @@ def _is_quality_article(body):
     return len(body) >= 200
 
 
+def _clean_llm_output(text):
+    """LLM 출력 후처리: 비한국어 문자 제거 + 말투 교정."""
+    import re
+    # 비한국어/비ASCII 스크립트 제거 (한글, ASCII, 숫자, 기본 구두점만 허용)
+    text = re.sub(r'[^\uAC00-\uD7A3\u3131-\u3163\u1100-\u11FF'
+                  r'a-zA-Z0-9\s\.,;:!\?\-\+\%\(\)\/\'\"~$&@#]', '', text)
+    # 말투 교정: 문장 끝 패턴 치환
+    replacements = [
+        (r'하고\s*있습니다', '하는 중'),
+        (r'되고\s*있습니다', '되는 중'),
+        (r'하고\s*있다', '하는 중'),
+        (r'되고\s*있다', '되는 중'),
+        (r'것으로\s*보입니다', '것으로 판단됨'),
+        (r'것으로\s*보인다', '것으로 판단됨'),
+        (r'수\s*있습니다', '수 있음'),
+        (r'수\s*있다', '수 있음'),
+        (r'때문입니다', '때문'),
+        (r'때문이다', '때문'),
+        (r'되었습니다', '됨'),
+        (r'되었다', '됨'),
+        (r'했습니다', '함'),
+        (r'했다', '함'),
+        (r'됩니다', '됨'),
+        (r'된다', '됨'),
+        (r'합니다', '함'),
+        (r'한다', '함'),
+        (r'입니다', '임'),
+        (r'이다', '임'),
+        (r'있습니다', '있음'),
+        (r'봅니다', '봄'),
+        (r'보인다', '보임'),
+        (r'겠습니다', '전망'),
+    ]
+    for pattern, repl in replacements:
+        text = re.sub(pattern, repl, text)
+    return text.strip()
+
+
 def _summarize_with_llm(sector_name, title, body):
     """Groq (Llama 3.3 70B)으로 '왜?' 요약 생성. SKIP 응답이면 None 반환."""
     try:
@@ -207,15 +245,15 @@ def _summarize_with_llm(sector_name, title, body):
                 {
                     "role": "system",
                     "content": (
-                        "미국 주식 시장 섹터 뉴스 분석가 역할.\n"
-                        "기사를 읽고 해당 섹터가 왜 움직였는지 인과관계를 1~2문장 한국어로 요약.\n\n"
-                        "말투 규칙 (반드시 준수):\n"
-                        "- 모든 문장을 '~함', '~됨', '~전망', '~영향' 등 명사형/간결체로 끝낼 것\n"
-                        "- 절대 금지: '~합니다', '~입니다', '~됩니다', '~보입니다', '~있다', '~했다', '~한다'\n"
-                        "- 좋은 예: '관세 철폐로 수입 비용 감소, 소비재 섹터 반등에 기여함'\n"
-                        "- 나쁜 예: '관세가 철폐되어 비용이 감소했습니다' / '반등하고 있다'\n\n"
-                        "인과관계가 없는 기사(단순 종목 소개, 광고, 영상 요약 등)면 "
-                        "반드시 SKIP 이라고만 답할 것."
+                        "미국 주식 시장 섹터 뉴스 분석가.\n"
+                        "기사를 읽고 해당 섹터의 등락 원인을 1문장 한국어로 요약.\n"
+                        "반드시 한국어만 사용. 영어 고유명사(기업명, ETF명)만 영어 허용.\n"
+                        "문장 끝은 반드시 명사형 간결체: ~함, ~됨, ~전망, ~때문, ~영향, ~기여 등.\n\n"
+                        "예시:\n"
+                        "- 대법원의 관세 무효화 판결로 수입 비용 부담 완화, 소비재 섹터 반등에 기여함\n"
+                        "- AI 투자 과열 우려 확산으로 기술주 전반 매도세 발생, 섹터 하락 요인으로 작용함\n"
+                        "- 금리 인하 기대감에 부동산 관련주 상승, XLRE 0.5% 상승함\n\n"
+                        "인과관계 없는 기사(종목 소개, 광고, 영상)면 SKIP 이라고만 답할 것."
                     ),
                 },
                 {
@@ -227,13 +265,13 @@ def _summarize_with_llm(sector_name, title, body):
                     ),
                 },
             ],
-            temperature=0.3,
-            max_tokens=200,
+            temperature=0.2,
+            max_tokens=150,
         )
         result = response.choices[0].message.content.strip()
         if result.upper() == "SKIP":
             return None
-        return result
+        return _clean_llm_output(result)
     except Exception:
         return None
 
