@@ -2,7 +2,7 @@ yfinance
 pandas
 requests
 python-dotenv
-streamlit>=1.45.0
+streamlit>=1.54.0
 plotly
 schedule
 deep-translator
