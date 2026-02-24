@@ -280,6 +280,9 @@ def fetch_weekly_earnings():
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("발표일").reset_index(drop=True)
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            name_map = dict(pool.map(_get_stock_name, df["티커"]))
+        df.insert(0, "종목명", df["티커"].map(name_map))
     return df
 
 
