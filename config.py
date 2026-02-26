@@ -23,6 +23,9 @@ CHANNEL_ID = _get("CHANNEL_ID")
 GROQ_API_KEY = _get("GROQ_API_KEY")
 GROQ_MODEL = _get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
+# ── FMP (yfinance 폴백용) ──
+FMP_API_KEY = _get("FMP_API_KEY")
+
 # ── GitHub Archive ──
 GITHUB_TOKEN = _get("GITHUB_TOKEN")
 GITHUB_REPO = _get("GITHUB_REPO", "JW-119/us-market-recap")

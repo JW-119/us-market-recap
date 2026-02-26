@@ -16,22 +16,214 @@ from config import (
     BARCHART_PAGE_URL, BARCHART_API_URL, BARCHART_HEADERS,
     NEW_HIGHS_TARGETS, NEW_HIGHS_FIELDS, NEW_HIGHS_MIN_MARKET_CAP,
     NEW_HIGHS_PAGE_SIZE, GROQ_API_KEY, GROQ_MODEL, SECTOR_NEWS_QUERIES,
+    FMP_API_KEY,
 )
 
 log = logging.getLogger(__name__)
 
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
+
+# ── Stooq 티커 매핑 (Yahoo → Stooq) ──
+_STOOQ_INDEX_MAP = {
+    "^GSPC": "^SPX",
+    "^IXIC": "^NDQ",
+    "^DJI": "^DJI",
+}
+
+
+def _to_stooq(yahoo_ticker):
+    """Yahoo Finance 티커 → Stooq 티커 변환."""
+    if yahoo_ticker in _STOOQ_INDEX_MAP:
+        return _STOOQ_INDEX_MAP[yahoo_ticker]
+    if yahoo_ticker.startswith("^"):
+        return yahoo_ticker  # 그대로 시도
+    return f"{yahoo_ticker}.US"
+
+
+# ── Stooq 폴백 헬퍼 (무료, API 키 불필요) ──
+
+def _stooq_download(ticker, days=10):
+    """Stooq에서 OHLCV CSV 다운로드. 실패 시 빈 DataFrame."""
+    from io import StringIO
+    stooq_tkr = _to_stooq(ticker)
+    end = datetime.now()
+    start = end - timedelta(days=days + 15)
+    try:
+        resp = requests.get(
+            "https://stooq.com/q/d/l/",
+            params={
+                "s": stooq_tkr,
+                "d1": start.strftime("%Y%m%d"),
+                "d2": end.strftime("%Y%m%d"),
+                "i": "d",
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        if resp.status_code != 200 or "No data" in resp.text:
+            return pd.DataFrame()
+        df = pd.read_csv(StringIO(resp.text))
+        if df.empty or "Close" not in df.columns:
+            return pd.DataFrame()
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        return df
+    except Exception as e:
+        log.warning("Stooq download failed for %s: %s", ticker, e)
+    return pd.DataFrame()
+
+
+# ── FMP (Financial Modeling Prep) 폴백 헬퍼 (선택적, API 키 필요) ──
+
+def _fmp_batch_quotes(tickers):
+    """FMP API 배치 시세 조회. {symbol: {price, previousClose, change, ...}}."""
+    if not FMP_API_KEY:
+        return {}
+    symbols = ",".join(tickers)
+    try:
+        resp = requests.get(
+            f"{FMP_BASE}/quote/{symbols}",
+            params={"apikey": FMP_API_KEY},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return {item["symbol"]: item for item in data}
+    except Exception as e:
+        log.warning("FMP batch quote failed: %s", e)
+    return {}
+
+
+def _fmp_history(ticker, days=30):
+    """FMP API 히스토리컬 OHLCV DataFrame 반환."""
+    if not FMP_API_KEY:
+        return pd.DataFrame()
+    try:
+        resp = requests.get(
+            f"{FMP_BASE}/historical-price-full/{ticker}",
+            params={"timeseries": days, "apikey": FMP_API_KEY},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        hist = resp.json().get("historical", [])
+        if not hist:
+            return pd.DataFrame()
+        df = pd.DataFrame(hist)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        df = df.rename(columns={
+            "open": "Open", "high": "High", "low": "Low",
+            "close": "Close", "volume": "Volume",
+        })
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception as e:
+        log.warning("FMP history failed for %s: %s", ticker, e)
+    return pd.DataFrame()
+
+
+# ── 통합 데이터 조회 (yfinance → Stooq → FMP 폴백) ──
+
+def _batch_quote_data(tickers):
+    """복수 종목 종가/전일종가 조회. yfinance → Stooq → FMP 폴백.
+
+    Returns:
+        dict: {ticker: (close, prev_close)} — 실패 종목은 제외
+    """
+    result = {}
+
+    # 1) yfinance 시도
+    try:
+        data = yf.download(tickers, period="5d", progress=False, group_by="ticker")
+        for tkr in tickers:
+            try:
+                df = data[tkr] if len(tickers) > 1 else data
+                df = df.dropna(subset=["Close"])
+                if len(df) >= 2:
+                    result[tkr] = (float(df["Close"].iloc[-1]),
+                                   float(df["Close"].iloc[-2]))
+            except Exception:
+                continue
+    except Exception as e:
+        log.warning("yfinance batch download failed: %s", e)
+
+    if result:
+        return result
+
+    # 2) Stooq 폴백 (무료, API 키 불필요)
+    log.info("yfinance empty — falling back to Stooq for %d tickers", len(tickers))
+    for tkr in tickers:
+        df = _stooq_download(tkr, days=10)
+        if len(df) >= 2:
+            result[tkr] = (float(df["Close"].iloc[-1]),
+                           float(df["Close"].iloc[-2]))
+
+    missing = [t for t in tickers if t not in result]
+    if not missing:
+        return result
+
+    # 3) FMP 폴백 (API 키 있을 때만)
+    if FMP_API_KEY and missing:
+        log.info("Stooq missing %d tickers — trying FMP", len(missing))
+        quotes = _fmp_batch_quotes(missing)
+        for tkr in missing:
+            q = quotes.get(tkr)
+            if q and q.get("price") and q.get("previousClose"):
+                result[tkr] = (q["price"], q["previousClose"])
+
+    return result
+
+
+def _download_history(ticker, period="1mo"):
+    """히스토리컬 OHLCV 조회. yfinance → Stooq → FMP 폴백."""
+    days_map = {"5d": 5, "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365}
+    days = days_map.get(period, 30)
+
+    # 1) yfinance 시도
+    try:
+        df = yf.download(ticker, period=period, progress=False)
+        if not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df
+    except Exception as e:
+        log.warning("yfinance history failed for %s: %s", ticker, e)
+
+    # 2) Stooq 폴백
+    log.info("Falling back to Stooq history for %s (%d days)", ticker, days)
+    df = _stooq_download(ticker, days=days)
+    if not df.empty:
+        return df
+
+    # 3) FMP 폴백
+    log.info("Falling back to FMP history for %s (%d days)", ticker, days)
+    return _fmp_history(ticker, days)
+
 
 def get_market_date():
-    """마지막 거래일 문자열 (YYYY-MM-DD). 최대 3회 재시도."""
-    for attempt in range(3):
+    """마지막 거래일 문자열 (YYYY-MM-DD). yfinance → Stooq → FMP 폴백."""
+    # 1) yfinance 시도 (최대 2회)
+    for attempt in range(2):
         try:
             sp = yf.download("^GSPC", period="5d", progress=False)
             if not sp.empty:
                 return str(sp.index[-1].date())
         except Exception as e:
-            log.warning("get_market_date attempt %d failed: %s", attempt + 1, e)
-        if attempt < 2:
+            log.warning("get_market_date yf attempt %d failed: %s", attempt + 1, e)
+        if attempt < 1:
             time.sleep(2)
+
+    # 2) Stooq 폴백
+    log.info("get_market_date: falling back to Stooq")
+    df = _stooq_download("^GSPC", days=10)
+    if not df.empty:
+        return str(df.index[-1].date())
+
+    # 3) FMP 폴백
+    log.info("get_market_date: falling back to FMP")
+    df = _fmp_history("^GSPC", days=5)
+    if not df.empty:
+        return str(df.index[-1].date())
     return None
 
 
@@ -67,58 +259,44 @@ def fetch_fear_greed():
 
 
 def fetch_indices():
-    """주요 지수별 종가·전일대비·등락률 DataFrame 반환."""
+    """주요 지수별 종가·전일대비·등락률 DataFrame 반환. (yfinance → FMP 폴백)"""
     tickers = list(INDICES.keys())
-    data = yf.download(tickers, period="5d", progress=False, group_by="ticker")
+    quote_data = _batch_quote_data(tickers)
 
     rows = []
     for tkr, name in INDICES.items():
-        try:
-            if len(tickers) == 1:
-                df = data
-            else:
-                df = data[tkr]
-            df = df.dropna(subset=["Close"])
-            if len(df) < 2:
-                continue
-            close = float(df["Close"].iloc[-1])
-            prev = float(df["Close"].iloc[-2])
-            chg = close - prev
-            pct = chg / prev * 100
-            rows.append({
-                "이름": name,
-                "티커": tkr,
-                "종가": round(close, 2),
-                "변동": round(chg, 2),
-                "등락률": round(pct, 2),
-            })
-        except Exception:
+        if tkr not in quote_data:
             continue
+        close, prev = quote_data[tkr]
+        chg = close - prev
+        pct = chg / prev * 100
+        rows.append({
+            "이름": name,
+            "티커": tkr,
+            "종가": round(close, 2),
+            "변동": round(chg, 2),
+            "등락률": round(pct, 2),
+        })
     return pd.DataFrame(rows)
 
 
 def fetch_sectors():
-    """섹터 ETF별 등락률 DataFrame 반환 (등락률 내림차순)."""
+    """섹터 ETF별 등락률 DataFrame 반환 (등락률 내림차순). (yfinance → FMP 폴백)"""
     tickers = list(SECTOR_ETFS.keys())
-    data = yf.download(tickers, period="5d", progress=False, group_by="ticker")
+    quote_data = _batch_quote_data(tickers)
 
     rows = []
     for tkr, name in SECTOR_ETFS.items():
-        try:
-            df = data[tkr].dropna(subset=["Close"])
-            if len(df) < 2:
-                continue
-            close = float(df["Close"].iloc[-1])
-            prev = float(df["Close"].iloc[-2])
-            pct = (close - prev) / prev * 100
-            rows.append({
-                "섹터": name,
-                "티커": tkr,
-                "종가": round(close, 2),
-                "등락률": round(pct, 2),
-            })
-        except Exception:
+        if tkr not in quote_data:
             continue
+        close, prev = quote_data[tkr]
+        pct = (close - prev) / prev * 100
+        rows.append({
+            "섹터": name,
+            "티커": tkr,
+            "종가": round(close, 2),
+            "등락률": round(pct, 2),
+        })
     result = pd.DataFrame(rows)
     if not result.empty:
         result = result.sort_values("등락률", ascending=False).reset_index(drop=True)
@@ -126,7 +304,17 @@ def fetch_sectors():
 
 
 def _get_stock_name(tkr):
-    """yfinance에서 종목 shortName 조회. 실패 시 티커 반환."""
+    """종목 이름 조회. FMP → yfinance 순서. 실패 시 티커 반환."""
+    # FMP로 먼저 시도 (배치에서 이미 받은 데이터 활용)
+    if FMP_API_KEY:
+        try:
+            quotes = _fmp_batch_quotes([tkr])
+            q = quotes.get(tkr)
+            if q and q.get("name"):
+                return tkr, q["name"]
+        except Exception:
+            pass
+    # yfinance 폴백
     try:
         info = yf.Ticker(tkr).info
         return tkr, info.get("shortName", tkr)
@@ -135,27 +323,22 @@ def _get_stock_name(tkr):
 
 
 def fetch_top_movers(top_n=10):
-    """대형주 상승/하락 Top N → (gainers_df, losers_df) 튜플."""
+    """대형주 상승/하락 Top N → (gainers_df, losers_df) 튜플. (yfinance → FMP 폴백)"""
     tickers = MAJOR_STOCKS
-    data = yf.download(tickers, period="5d", progress=False, group_by="ticker")
+    quote_data = _batch_quote_data(tickers)
 
     rows = []
     for tkr in tickers:
-        try:
-            df = data[tkr].dropna(subset=["Close"])
-            if len(df) < 2:
-                continue
-            close = float(df["Close"].iloc[-1])
-            prev = float(df["Close"].iloc[-2])
-            chg = close - prev
-            pct = chg / prev * 100
-            rows.append({
-                "티커": tkr,
-                "종가": round(close, 2),
-                "등락률": round(pct, 2),
-            })
-        except Exception:
+        if tkr not in quote_data:
             continue
+        close, prev = quote_data[tkr]
+        chg = close - prev
+        pct = chg / prev * 100
+        rows.append({
+            "티커": tkr,
+            "종가": round(close, 2),
+            "등락률": round(pct, 2),
+        })
 
     all_df = pd.DataFrame(rows)
     if all_df.empty:
@@ -165,10 +348,21 @@ def fetch_top_movers(top_n=10):
     gainers = all_df.head(top_n).reset_index(drop=True)
     losers = all_df.tail(top_n).sort_values("등락률").reset_index(drop=True)
 
-    # 상위/하위 종목에 대해서만 이름 조회 (병렬)
-    need_names = set(gainers["티커"]) | set(losers["티커"])
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        name_map = dict(pool.map(_get_stock_name, need_names))
+    # FMP 배치로 이름 한번에 조회 시도
+    need_names = list(set(gainers["티커"]) | set(losers["티커"]))
+    name_map = {}
+    if FMP_API_KEY:
+        fmp_quotes = _fmp_batch_quotes(need_names)
+        for tkr in need_names:
+            q = fmp_quotes.get(tkr)
+            if q and q.get("name"):
+                name_map[tkr] = q["name"]
+    # 누락된 종목은 yfinance로 보충
+    missing = [t for t in need_names if t not in name_map]
+    if missing:
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            for tkr, name in pool.map(_get_stock_name, missing):
+                name_map[tkr] = name
 
     for df in (gainers, losers):
         df.insert(0, "종목명", df["티커"].map(name_map))
@@ -718,14 +912,8 @@ def fetch_weekly_earnings():
 
 
 def fetch_index_history(ticker, period="1mo"):
-    """캔들차트용 OHLCV DataFrame (날짜 인덱스)."""
-    df = yf.download(ticker, period=period, progress=False)
-    if df.empty:
-        return df
-    # MultiIndex columns → flatten
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
+    """캔들차트용 OHLCV DataFrame (날짜 인덱스). (yfinance → FMP 폴백)"""
+    return _download_history(ticker, period)
 
 
 # ── Barchart New Highs ──
