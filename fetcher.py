@@ -439,10 +439,33 @@ _groq_limiter = _GroqRateLimiter()
 
 # ── Google News RSS 수집 ──
 
+def _news_after_date():
+    """Google News 검색용 after: 날짜. 당일 뉴스 위주 (월요일은 주말 포함).
+
+    - 화~금: 전일 (전일 장 후 + 당일 기사)
+    - 월요일: 금요일부터 (주말 뉴스 포함)
+    - 토/일: 금요일부터
+    """
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    today = now_et.date()
+    weekday = today.weekday()  # 0=Mon, 6=Sun
+
+    if weekday == 0:  # Monday → 금요일부터
+        return today - timedelta(days=3)
+    elif weekday == 6:  # Sunday → 금요일부터
+        return today - timedelta(days=2)
+    elif weekday == 5:  # Saturday → 금요일
+        return today - timedelta(days=1)
+    else:  # Tue-Fri → 전일
+        return today - timedelta(days=1)
+
+
 def _fetch_google_news_rss(ticker, query):
     """Google News RSS에서 검색 쿼리로 기사 수집. 최대 10개 반환."""
     encoded = quote(query)
-    url = f"https://news.google.com/rss/search?q={encoded}+when:1d&hl=en-US&gl=US&ceid=US:en"
+    after = _news_after_date()
+    url = f"https://news.google.com/rss/search?q={encoded}+after:{after}&hl=en-US&gl=US&ceid=US:en"
     try:
         feed = feedparser.parse(url)
         results = []
