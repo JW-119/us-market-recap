@@ -559,13 +559,26 @@ def _synthesize_sector_summary(sector_name, summaries):
 
 
 def _extract_article_body(url):
-    """trafilatura로 기사 본문 추출. 실패 시 빈 문자열 반환."""
+    """trafilatura로 기사 본문 추출. 실패 시 빈 문자열 반환.
+
+    trafilatura.fetch_url() 대신 requests.get()을 사용하여
+    timeout을 보장하고 Google News 리다이렉트를 처리함.
+    """
     try:
         import trafilatura
-        downloaded = trafilatura.fetch_url(url)
-        if not downloaded:
+        resp = requests.get(
+            url, timeout=8, allow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        if resp.status_code != 200:
             return ""
-        text = trafilatura.extract(downloaded)
+        text = trafilatura.extract(resp.text)
         return text or ""
     except Exception:
         return ""
@@ -708,7 +721,8 @@ def fetch_sector_news():
                     "url": url,
                 })
             return tkr, results
-        except Exception:
+        except Exception as e:
+            log.debug("yfinance news failed for %s: %s", tkr, e)
             return tkr, []
 
     def _get_google_news(tkr):
@@ -737,10 +751,11 @@ def fetch_sector_news():
     for tkr, sector_name in sector_map.items():
         combined = yf_results.get(tkr, []) + gn_results.get(tkr, [])
         deduped = _deduplicate_articles(combined)
-        raw_output[sector_name] = deduped
-        log.info("%s: yf=%d, gn=%d, dedup=%d",
+        raw_output[sector_name] = deduped[:7]  # 본문 추출 부하 제한
+        log.info("%s: yf=%d, gn=%d, dedup=%d, kept=%d",
                  sector_name, len(yf_results.get(tkr, [])),
-                 len(gn_results.get(tkr, [])), len(deduped))
+                 len(gn_results.get(tkr, [])), len(deduped),
+                 len(raw_output[sector_name]))
 
     if not use_llm:
         # ── Non-LLM: yfinance summary + deep_translator 번역, 새 구조 반환 ──
@@ -776,8 +791,11 @@ def fetch_sector_news():
             all_articles.append((sector, article))
 
     urls = [a[1]["url"] for a in all_articles]
+    log.info("Extracting bodies for %d articles across all sectors...", len(urls))
     with ThreadPoolExecutor(max_workers=10) as pool:
         bodies = list(pool.map(_extract_article_body, urls))
+    extracted = sum(1 for b in bodies if b)
+    log.info("Body extraction: %d/%d successful", extracted, len(urls))
 
     # 3) 품질 필터 (200자+) + 품질 점수 정렬 → 섹터당 상위 5개
     sector_candidates = {name: [] for name in sector_map.values()}
@@ -859,6 +877,36 @@ def fetch_sector_news():
             "synthesis": synthesis_map.get(sector_name, ""),
             "articles": sector_articles.get(sector_name, []),
         }
+
+    # 8) 빈 섹터에 non-LLM 폴백: 원본 기사 제목 번역하여 표시
+    empty_sectors = [s for s in output
+                     if not output[s]["articles"] and not output[s]["synthesis"]]
+    if empty_sectors:
+        log.info("LLM fallback: %d/%d sectors empty, using translated titles",
+                 len(empty_sectors), len(output))
+        fallback_titles = []
+        fallback_map = []  # (sector_name, article_idx)
+        for sector_name in empty_sectors:
+            raw = raw_output.get(sector_name, [])[:3]
+            articles = []
+            for i, article in enumerate(raw):
+                articles.append({
+                    "title": article["title"],
+                    "summary": "",
+                    "publisher": article.get("publisher", ""),
+                    "url": article.get("url", ""),
+                })
+                if article.get("title"):
+                    fallback_titles.append(article["title"])
+                    fallback_map.append((sector_name, i))
+            output[sector_name]["articles"] = articles
+
+        if fallback_titles:
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                translated = list(pool.map(_translate_text, fallback_titles))
+            for (sector_name, i), title_kr in zip(fallback_map, translated):
+                if i < len(output[sector_name]["articles"]):
+                    output[sector_name]["articles"][i]["title"] = title_kr
 
     return output
 
