@@ -148,6 +148,12 @@ def _init_news_scheduler():
                     log.info("News scheduler: slot %s ready", slot)
             except Exception as e:
                 log.warning("News scheduler error: %s", e)
+                # 에러 발생 시에도 ready 설정하여 대시보드 무한 대기 방지
+                if not state["ready"].is_set():
+                    with state["lock"]:
+                        state["data"] = {}
+                    state["ready"].set()
+                    log.warning("News scheduler: set ready with empty data due to error")
             time.sleep(300)  # 5분마다 슬롯 변경 체크
 
     threading.Thread(target=_loop, daemon=True).start()
@@ -181,7 +187,7 @@ if is_live:
     fg = cached_fear_greed()
     if not _news_bg["ready"].is_set():
         with st.spinner("섹터 뉴스를 수집하는 중... (첫 로딩 시 약 2분 소요)"):
-            _news_bg["ready"].wait()
+            _news_bg["ready"].wait(timeout=180)  # 최대 3분 대기
     with _news_bg["lock"]:
         sector_news = _news_bg["data"] or {}
     new_highs = cached_new_highs()

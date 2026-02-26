@@ -15,18 +15,24 @@ from config import (
     INDICES, SECTOR_ETFS, MAJOR_STOCKS,
     BARCHART_PAGE_URL, BARCHART_API_URL, BARCHART_HEADERS,
     NEW_HIGHS_TARGETS, NEW_HIGHS_FIELDS, NEW_HIGHS_MIN_MARKET_CAP,
-    NEW_HIGHS_PAGE_SIZE, GROQ_API_KEY, SECTOR_NEWS_QUERIES,
+    NEW_HIGHS_PAGE_SIZE, GROQ_API_KEY, GROQ_MODEL, SECTOR_NEWS_QUERIES,
 )
 
 log = logging.getLogger(__name__)
 
 
 def get_market_date():
-    """마지막 거래일 문자열 (YYYY-MM-DD)."""
-    sp = yf.download("^GSPC", period="5d", progress=False)
-    if sp.empty:
-        return None
-    return str(sp.index[-1].date())
+    """마지막 거래일 문자열 (YYYY-MM-DD). 최대 3회 재시도."""
+    for attempt in range(3):
+        try:
+            sp = yf.download("^GSPC", period="5d", progress=False)
+            if not sp.empty:
+                return str(sp.index[-1].date())
+        except Exception as e:
+            log.warning("get_market_date attempt %d failed: %s", attempt + 1, e)
+        if attempt < 2:
+            time.sleep(2)
+    return None
 
 
 def fetch_fear_greed():
@@ -341,7 +347,7 @@ def _synthesize_sector_summary(sector_name, summaries):
             _groq_limiter.acquire(est_tokens)
             client = Groq(api_key=GROQ_API_KEY)
             response = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                model=GROQ_MODEL,
                 messages=messages,
                 temperature=0.2,
                 max_tokens=200,
@@ -454,7 +460,7 @@ def _summarize_with_llm(sector_name, title, body):
             _groq_limiter.acquire(est_tokens)
             client = Groq(api_key=GROQ_API_KEY)
             response = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                model=GROQ_MODEL,
                 messages=messages,
                 temperature=0.2,
                 max_tokens=150,

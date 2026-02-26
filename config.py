@@ -21,6 +21,7 @@ CHANNEL_ID = _get("CHANNEL_ID")
 
 # ── Groq (섹터 뉴스 LLM 요약) ──
 GROQ_API_KEY = _get("GROQ_API_KEY")
+GROQ_MODEL = _get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 # ── GitHub Archive ──
 GITHUB_TOKEN = _get("GITHUB_TOKEN")
