@@ -2,7 +2,7 @@ yfinance
 pandas
 requests
 python-dotenv
-streamlit>=1.54.0
+streamlit>=1.50.0
 # force restart
 plotly
 schedule

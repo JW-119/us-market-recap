@@ -1,4 +1,5 @@
 """일일 시황 아카이브 — GitHub 저장소에 JSON으로 저장/로드."""
+from __future__ import annotations
 
 import json
 import base64

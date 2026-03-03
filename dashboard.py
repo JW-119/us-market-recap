@@ -314,7 +314,7 @@ if not sectors.empty:
         height=400,
         margin=dict(l=0, r=40, t=10, b=30),
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 
@@ -399,7 +399,7 @@ for tab, target in zip(nh_tabs, ["52주 신고가", "3개월 신고가"]):
         if df.empty:
             st.info(f"{target} 데이터가 없습니다.")
         else:
-            st.dataframe(df, hide_index=True, width="stretch")
+            st.dataframe(df, hide_index=True, use_container_width=True)
 
 st.divider()
 
@@ -409,7 +409,7 @@ st.subheader("📅 이번 주 실적 발표 일정")
 if earnings_df.empty:
     st.info("이번 주 예정된 실적 발표가 없습니다.")
 else:
-    st.dataframe(earnings_df, hide_index=True, width="stretch")
+    st.dataframe(earnings_df, hide_index=True, use_container_width=True)
 
 st.divider()
 
@@ -441,7 +441,7 @@ if is_live:
                 height=420,
                 margin=dict(l=0, r=0, t=40, b=30),
             )
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
@@ -456,7 +456,7 @@ with col_gain:
         display = gainers[["종목명", "티커", "종가", "등락률"]].copy()
         display["등락률"] = display["등락률"].apply(lambda x: f"+{x:.2f}%")
         display["종가"] = display["종가"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(display, hide_index=True, width="stretch")
+        st.dataframe(display, hide_index=True, use_container_width=True)
 
 with col_lose:
     st.markdown("**🔻 하락**")
@@ -464,4 +464,4 @@ with col_lose:
         display = losers[["종목명", "티커", "종가", "등락률"]].copy()
         display["등락률"] = display["등락률"].apply(lambda x: f"{x:.2f}%")
         display["종가"] = display["종가"].apply(lambda x: f"{x:,.2f}")
-        st.dataframe(display, hide_index=True, width="stretch")
+        st.dataframe(display, hide_index=True, use_container_width=True)

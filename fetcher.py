@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import threading
 import time
@@ -440,10 +442,9 @@ _groq_limiter = _GroqRateLimiter()
 # ── Google News RSS 수집 ──
 
 def _news_after_date():
-    """Google News 검색용 after: 날짜. 당일 뉴스 위주 (월요일은 주말 포함).
+    """Google News 검색용 after: 날짜. 당일 뉴스만 수집.
 
-    - 화~금: 전일 (전일 장 후 + 당일 기사)
-    - 월요일: 금요일부터 (주말 뉴스 포함)
+    - 월~금: 당일 (장 마감 후 분석 기사 위주)
     - 토/일: 금요일부터
     """
     from zoneinfo import ZoneInfo
@@ -451,14 +452,12 @@ def _news_after_date():
     today = now_et.date()
     weekday = today.weekday()  # 0=Mon, 6=Sun
 
-    if weekday == 0:  # Monday → 금요일부터
-        return today - timedelta(days=3)
-    elif weekday == 6:  # Sunday → 금요일부터
+    if weekday == 5:  # Saturday → 금요일
+        return today - timedelta(days=1)
+    elif weekday == 6:  # Sunday → 금요일
         return today - timedelta(days=2)
-    elif weekday == 5:  # Saturday → 금요일
-        return today - timedelta(days=1)
-    else:  # Tue-Fri → 전일
-        return today - timedelta(days=1)
+    else:  # Mon-Fri → 당일
+        return today
 
 
 def _fetch_google_news_rss(ticker, query):
